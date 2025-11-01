@@ -1,0 +1,189 @@
+# Kuma Bot
+
+クマ出没情報を自動収集してMastodonに投稿するGoアプリケーションです。AWS Lambdaでの実行とローカル実行の両方に対応しています。
+
+## 機能
+
+- ニュースサイトからクマ出没情報を自動収集
+- 投稿済みURLをS3で管理し、重複投稿を防止
+- 古い投稿記録の自動クリーンアップ（30日間保持）
+- Mastodonへの自動投稿（unlisted設定）
+- Lambda環境とローカル環境の自動判定
+
+## セットアップ
+
+### 1. 依存関係のインストール
+
+```bash
+go mod tidy
+```
+
+### 2. 設定ファイルの作成
+
+```bash
+cp config.json.example config.json
+```
+
+`config.json`を編集してMastodonの認証情報とAWS設定を設定：
+
+```json
+{
+    "mastodon": {
+        "server": "https://your-mastodon-server.com",
+        "client_id": "your_client_id_here",
+        "client_secret": "your_client_secret_here",
+        "access_token": "your_access_token_here"
+    },
+    "aws": {
+        "region": "ap-northeast-1",
+        "s3": {
+            "bucket_name": "kuma-posted-urls",
+            "object_key": "posted_urls.json"
+        }
+    }
+}
+```
+
+### 3. AWS設定（Lambda使用時）
+
+設定ファイルで指定したS3バケットを作成し、適切なIAMロールを設定してください。
+
+#### 必要なIAM権限
+Lambda実行ロールには以下の権限が必要です：
+- S3バケットへの読み書き権限（GetObject, PutObject）
+- CloudWatch Logsへの書き込み権限
+
+## 使用方法
+
+### ローカル実行
+
+```bash
+go run main.go
+```
+
+### Lambda デプロイ
+
+```bash
+# デフォルト設定でデプロイ
+./deploy.sh
+
+# カスタムプロファイルでデプロイ
+./deploy.sh my-profile
+
+# カスタムプロファイルと関数名でデプロイ
+./deploy.sh my-profile my-function-name
+```
+
+## 環境変数（Lambda環境）
+
+Lambda環境では以下の環境変数を設定してください：
+
+- `MASTODON_SERVER` - MastodonサーバーのURL
+- `MASTODON_CLIENT_ID` - MastodonアプリのクライアントID
+- `MASTODON_CLIENT_SECRET` - Mastodonアプリのクライアントシークレット
+- `MASTODON_ACCESS_TOKEN` - Mastodonのアクセストークン
+- `S3_BUCKET_NAME` - S3バケット名
+- `S3_OBJECT_KEY` - S3オブジェクトキー
+- `KUMA_AWS_REGION` - AWSリージョン（オプション、`AWS_REGION`が優先される）
+
+**注意**: `KUMA_AWS_REGION`を設定することで、Lambda環境でもカスタムリージョンを指定できます。設定しない場合は`AWS_REGION`（Lambda予約済み環境変数）が使用されます。
+
+## 設定
+
+### 定数設定
+
+`main.go`内の定数で動作をカスタマイズできます：
+
+- `MaxPages` - 取得する最大ページ数（デフォルト: 3）
+- `PostedURLRetentionDays` - 投稿済みURL保持日数（デフォルト: 30日）
+
+### 設定ファイル項目
+
+#### `mastodon` - Mastodon接続設定
+- `server` - MastodonサーバーのURL
+- `client_id` - アプリケーションのクライアントID
+- `client_secret` - アプリケーションのクライアントシークレット
+- `access_token` - ユーザーのアクセストークン
+
+#### `aws` - AWS設定
+- `region` - AWSリージョン（例: ap-northeast-1）
+- `s3.bucket_name` - 投稿済みURL管理用S3バケット名
+- `s3.object_key` - S3オブジェクトキー（JSONファイル名）
+
+### 投稿形式
+
+Mastodonへの投稿は以下の形式で行われます：
+
+```
+🐻 [記事タイトル]
+
+🔗 [記事URL]
+
+📍 [地域] [情報源] [日付] [時刻]
+
+#クマ出没情報
+```
+
+## ファイル構成
+
+```
+.
+├── main.go              # メインアプリケーション
+├── config.json          # 設定ファイル（Git管理対象外）
+├── config.json.example  # 設定ファイルのサンプル
+├── deploy.sh            # Lambdaデプロイスクリプト
+├── go.mod               # Go モジュール定義
+├── go.sum               # Go モジュール依存関係
+├── .gitignore           # Git除外設定
+└── README.md            # このファイル
+```
+
+## 依存ライブラリ
+
+- `github.com/aws/aws-lambda-go/lambda` - AWS Lambda Go SDK
+- `github.com/aws/aws-sdk-go-v2/*` - AWS SDK for Go v2
+- `github.com/PuerkitoBio/goquery` - HTMLパースとスクレイピング
+- `github.com/mattn/go-mastodon` - Mastodon API クライアント
+
+## 技術仕様
+
+### 環境判定
+- `AWS_LAMBDA_FUNCTION_NAME`環境変数の存在でLambda環境を自動判定
+- Lambda環境では環境変数、ローカル環境では`config.json`から設定を読み込み
+
+### AWSリージョン設定
+- `KUMA_AWS_REGION`環境変数を優先使用
+- 設定されていない場合は`AWS_REGION`（Lambda予約済み環境変数）を使用
+- ローカル環境では`config.json`の設定を使用
+
+### 投稿制御
+- 投稿間隔: 200ミリ秒
+- 投稿可視性: unlisted
+- 重複投稿防止: S3でURL管理
+- データ保持期間: 30日間
+
+## 注意事項
+
+- `config.json`は機密情報を含むため、Git管理に含めないでください
+- S3バケットへの適切なアクセス権限が必要です
+- Lambda環境では`AWS_REGION`環境変数が自動設定されます
+
+## トラブルシューティング
+
+### よくある問題
+
+#### Lambda環境で`AWS_REGION`エラーが発生する
+- `AWS_REGION`はLambdaの予約済み環境変数のため、手動設定できません
+- カスタムリージョンが必要な場合は`KUMA_AWS_REGION`を使用してください
+
+#### S3アクセスエラー
+- Lambda実行ロールにS3バケットへの適切な権限があることを確認してください
+- バケット名とオブジェクトキーが正しく設定されていることを確認してください
+
+#### Mastodon投稿エラー
+- アクセストークンが有効であることを確認してください
+- サーバーURLが正しいことを確認してください
+
+## ライセンス
+
+このプロジェクトはMITライセンスの下で公開されています。
