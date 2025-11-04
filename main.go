@@ -4,11 +4,13 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
 	"os"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -23,43 +25,65 @@ import (
 )
 
 const (
-	// kumaNewsURL クマ出没情報のニュースURL
-	kumaNewsURL = "https://topics.smt.docomo.ne.jp/latestnews/keywords/592c8cd81446273da9280cdf06875ec2347a5b3bd970bca305d5cb869e7c4161"
-
-	// MaxPages 取得する最大ページ数
-	MaxPages = 3
-
-	// PostedURLRetentionDays 投稿済みURL保持日数
+	kumaNewsURL            = "https://topics.smt.docomo.ne.jp/latestnews/keywords/592c8cd81446273da9280cdf06875ec2347a5b3bd970bca305d5cb869e7c4161"
+	MaxPages               = 3
 	PostedURLRetentionDays = 30
+	TootFetchLimit         = 40
+	JSTOffset              = 9 * 60 * 60
+	PostDelay              = 200 * time.Millisecond
+	HTTPTimeout            = 30 * time.Second
+	KumaPostTemplate       = `🐻 %s
+
+🔗 %s
+
+📍 %s
+
+#クマ出没情報`
+	SummaryPostTemplate = `🐻 昨日のクマ出没情報集計（全%d件）
+
+📍 都道府県別ランキング:
+%s
+
+#クマ出没情報`
 )
 
-// MastodonConfig Mastodon設定
+const (
+	prefecturePattern = `📍\s*([^\n📍]+)`
+)
+
+var prefectures = []string{
+	"北海道", "青森県", "岩手県", "宮城県", "秋田県", "山形県", "福島県",
+	"茨城県", "栃木県", "群馬県", "埼玉県", "千葉県", "東京都", "神奈川県",
+	"新潟県", "富山県", "石川県", "福井県", "山梨県", "長野県", "岐阜県",
+	"静岡県", "愛知県", "三重県", "滋賀県", "京都府", "大阪府", "兵庫県",
+	"奈良県", "和歌山県", "鳥取県", "島根県", "岡山県", "広島県", "山口県",
+	"徳島県", "香川県", "愛媛県", "高知県", "福岡県", "佐賀県", "長崎県",
+	"熊本県", "大分県", "宮崎県", "鹿児島県", "沖縄県",
+}
+
 type MastodonConfig struct {
 	Server       string `json:"server"`
 	ClientID     string `json:"client_id"`
 	ClientSecret string `json:"client_secret"`
 	AccessToken  string `json:"access_token"`
+	Visibility   string `json:"visibility"`
 }
 
-// S3Config S3設定
 type S3Config struct {
 	BucketName string `json:"bucket_name"`
 	ObjectKey  string `json:"object_key"`
 }
 
-// AWSConfig AWS設定
 type AWSConfig struct {
 	Region string   `json:"region"`
 	S3     S3Config `json:"s3"`
 }
 
-// Config アプリケーション設定
 type Config struct {
 	Mastodon MastodonConfig `json:"mastodon"`
 	AWS      AWSConfig      `json:"aws"`
 }
 
-// PostedURL 投稿済みURL情報の構造体
 type PostedURL struct {
 	URL         string    `json:"url"`
 	Title       string    `json:"title"`
@@ -68,61 +92,101 @@ type PostedURL struct {
 	PostedAt    time.Time `json:"posted_at"`
 }
 
-// main メイン関数 - Lambda環境とローカル環境を判定
+type PrefectureCount struct {
+	Prefecture string `json:"prefecture"`
+	Count      int    `json:"count"`
+}
+
+
 func main() {
-	// Lambda環境かどうかを判定
 	if isLambda() {
-		// Lambda環境ではハンドラーを起動
-		lambda.Start(runKumaBot)
+		lambda.Start(handleKumaBotRequest)
 	} else {
-		// ローカル環境では直接実行
-		if err := runKumaBot(context.Background()); err != nil {
+		var summaryMode bool
+		flag.BoolVar(&summaryMode, "summary", false, "run summary mode")
+		flag.Parse()
+
+		if err := handleKumaBotRequest(context.Background(), summaryMode); err != nil {
 			log.Fatal(err)
 		}
 	}
 }
 
-// isLambda Lambda環境かどうかを判定
 func isLambda() bool {
 	return len(os.Getenv("AWS_LAMBDA_FUNCTION_NAME")) > 0
 }
 
-// runKumaBot クマbotのメイン処理 - Lambdaハンドラーとしても使用
-func runKumaBot(ctx context.Context) error {
-	log.Println("Kuma Bot started - クマ出没情報をチェックします")
+func isMidnightJST() bool {
+	jst := time.FixedZone("JST", JSTOffset)
+	now := time.Now().In(jst)
 
-	// 設定を読み込み
-	config, err := loadConfig()
-	if err != nil {
-		log.Printf("Failed to load config: %v", err)
-		return err
-	}
-
-	// 投稿済みURLを読み込み
-	postedURLs, err := loadPostedURLs(ctx, config)
-	if err != nil {
-		log.Printf("Failed to load posted URLs: %v", err)
-		return err
-	}
-
-	// 古いURLを削除
-	postedURLs = cleanupOldURLs(postedURLs)
-
-	newPostedURLs, err := processLatestNews(postedURLs)
-	if err != nil {
-		return err
-	}
-
-	// Mastodonに投稿
-	successfullyPostedURLs := postToMastodon(ctx, config, newPostedURLs)
-
-	// 投稿済みURLを保存
-	return savePostedURLs(ctx, config, append(postedURLs, successfullyPostedURLs...))
+	return now.Hour() == 0 && now.Minute() == 0
 }
 
-// loadConfig 設定を読み込み
+func extractPrefecture(text string) string {
+	for _, prefecture := range prefectures {
+		if strings.Contains(text, prefecture) {
+			return prefecture
+		}
+	}
+
+	return ""
+}
+
+func formatPrefectureStats(stats []PrefectureCount) string {
+	var lines []string
+	for i, stat := range stats {
+		lines = append(lines, fmt.Sprintf("%d. %s：%d件", i+1, stat.Prefecture, stat.Count))
+	}
+	return strings.Join(lines, "\n")
+}
+
+func handleKumaBotRequest(ctx context.Context, summaryMode bool) error {
+	config, err := loadConfig()
+	if err != nil {
+		return fmt.Errorf("failed to load config: %w", err)
+	}
+
+	client := NewMastodonClient(config)
+
+	if summaryMode || (isLambda() && isMidnightJST()) {
+		log.Println("Starting prefecture summary mode")
+		if err := runPrefectureSummary(ctx, config, client); err != nil {
+			return fmt.Errorf("failed to run prefecture summary: %w", err)
+		}
+		log.Println("Completed prefecture summary mode")
+	}
+
+	log.Println("Starting normal mode - checking bear sightings")
+	existingURLs, err := loadPostedURLs(ctx, config)
+	if err != nil {
+		return fmt.Errorf("failed to load posted URLs: %w", err)
+	}
+	log.Printf("Loaded %d existing URLs from storage", len(existingURLs))
+
+	existingURLs = cleanupOldURLs(existingURLs)
+	log.Printf("After cleanup, %d URLs remain", len(existingURLs))
+
+	newPostedURLs, err := processLatestNews(existingURLs)
+	if err != nil {
+		return fmt.Errorf("failed to process latest news: %w", err)
+	}
+
+	if len(newPostedURLs) > 0 {
+		successfullyPostedURLs := postToMastodon(ctx, config, client, newPostedURLs)
+		log.Printf("Successfully posted %d new articles", len(successfullyPostedURLs))
+
+		if err := savePostedURLs(ctx, config, append(existingURLs, successfullyPostedURLs...)); err != nil {
+			return fmt.Errorf("failed to save posted URLs: %w", err)
+		}
+	} else {
+		log.Println("No new articles found to post")
+	}
+
+	return nil
+}
+
 func loadConfig() (*Config, error) {
-	// Lambda環境では環境変数から取得
 	if isLambda() {
 		return &Config{
 			Mastodon: MastodonConfig{
@@ -130,6 +194,7 @@ func loadConfig() (*Config, error) {
 				ClientID:     os.Getenv("MASTODON_CLIENT_ID"),
 				ClientSecret: os.Getenv("MASTODON_CLIENT_SECRET"),
 				AccessToken:  os.Getenv("MASTODON_ACCESS_TOKEN"),
+				Visibility:   os.Getenv("MASTODON_VISIBILITY"),
 			},
 			AWS: AWSConfig{
 				Region: getAWSRegion(),
@@ -141,41 +206,44 @@ func loadConfig() (*Config, error) {
 		}, nil
 	}
 
-	// ローカル環境ではconfig.jsonから取得
 	file, err := os.Open("config.json")
 	if err != nil {
-		return nil, fmt.Errorf("failed to open config.json: %v", err)
+		return nil, fmt.Errorf("failed to open config.json: %w", err)
 	}
 	defer file.Close()
 
 	var config Config
 	decoder := json.NewDecoder(file)
 	if err := decoder.Decode(&config); err != nil {
-		return nil, fmt.Errorf("failed to decode config.json: %v", err)
+		return nil, fmt.Errorf("failed to decode config.json: %w", err)
 	}
 
 	return &config, nil
 }
 
-// getAWSRegion AWSリージョンを取得（カスタム環境変数を優先）
 func getAWSRegion() string {
-	// カスタム環境変数を優先
 	if region := os.Getenv("KUMA_AWS_REGION"); region != "" {
 		return region
 	}
-	// Lambda予約済み環境変数をフォールバック
 	if region := os.Getenv("AWS_REGION"); region != "" {
 		return region
 	}
-	// デフォルト値
 	return "ap-northeast-1"
 }
 
-// loadPostedURLs S3から投稿済みURLを読み込み
+func NewMastodonClient(config *Config) *mastodon.Client {
+	return mastodon.NewClient(&mastodon.Config{
+		Server:       config.Mastodon.Server,
+		ClientID:     config.Mastodon.ClientID,
+		ClientSecret: config.Mastodon.ClientSecret,
+		AccessToken:  config.Mastodon.AccessToken,
+	})
+}
+
 func loadPostedURLs(ctx context.Context, appConfig *Config) ([]PostedURL, error) {
 	cfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(appConfig.AWS.Region))
 	if err != nil {
-		return nil, fmt.Errorf("failed to load AWS config: %v", err)
+		return nil, fmt.Errorf("failed to load AWS config: %w", err)
 	}
 
 	svc := s3.NewFromConfig(cfg)
@@ -185,30 +253,57 @@ func loadPostedURLs(ctx context.Context, appConfig *Config) ([]PostedURL, error)
 		Key:    aws.String(appConfig.AWS.S3.ObjectKey),
 	})
 	if err != nil {
-		return nil, fmt.Errorf("failed to get object from S3: %v", err)
+		return nil, fmt.Errorf("failed to get object from S3: %w", err)
 	}
 	defer result.Body.Close()
 
 	body, err := io.ReadAll(result.Body)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read S3 object body: %v", err)
+		return nil, fmt.Errorf("failed to read S3 object body: %w", err)
 	}
 
 	var postedURLs []PostedURL
 	if err := json.Unmarshal(body, &postedURLs); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal posted URLs: %v", err)
+		return nil, fmt.Errorf("failed to unmarshal posted URLs: %w", err)
 	}
 
 	log.Printf("Loaded %d posted URLs from S3", len(postedURLs))
 	return postedURLs, nil
 }
 
-// cleanupOldURLs 30日以上経過した投稿済みURLを削除
-func cleanupOldURLs(postedURLs []PostedURL) []PostedURL {
+func savePostedURLs(ctx context.Context, appConfig *Config, postedURLs []PostedURL) error {
+	cfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(appConfig.AWS.Region))
+	if err != nil {
+		return fmt.Errorf("failed to load AWS config: %w", err)
+	}
+
+	svc := s3.NewFromConfig(cfg)
+
+	data, err := json.MarshalIndent(postedURLs, "", "    ")
+	if err != nil {
+		return fmt.Errorf("failed to marshal posted URLs: %w", err)
+	}
+
+	contentType := "application/json"
+	_, err = svc.PutObject(ctx, &s3.PutObjectInput{
+		Bucket:      aws.String(appConfig.AWS.S3.BucketName),
+		Key:         aws.String(appConfig.AWS.S3.ObjectKey),
+		Body:        bytes.NewReader(data),
+		ContentType: &contentType,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to put object to S3: %w", err)
+	}
+
+	log.Printf("Saved %d posted URLs to S3", len(postedURLs))
+	return nil
+}
+
+func cleanupOldURLs(existingURLs []PostedURL) []PostedURL {
 	cutoffTime := time.Now().AddDate(0, 0, -PostedURLRetentionDays)
 
 	var validURLs []PostedURL
-	for _, posted := range postedURLs {
+	for _, posted := range existingURLs {
 		if posted.PostedAt.After(cutoffTime) {
 			validURLs = append(validURLs, posted)
 		}
@@ -217,17 +312,14 @@ func cleanupOldURLs(postedURLs []PostedURL) []PostedURL {
 	return validURLs
 }
 
-// processLatestNews 最新のクマ出没ニュースを処理
-func processLatestNews(postedURLs []PostedURL) ([]PostedURL, error) {
-	// 投稿済みURLのマップを作成
-	postedURLMap := make(map[string]struct{})
-	for _, posted := range postedURLs {
-		postedURLMap[posted.URL] = struct{}{}
+func processLatestNews(existingURLs []PostedURL) ([]PostedURL, error) {
+	existingURLMap := make(map[string]struct{})
+	for _, posted := range existingURLs {
+		existingURLMap[posted.URL] = struct{}{}
 	}
 
-	var allKumaInfos []*PostedURL
+	var allArticles []*PostedURL
 
-	// 複数ページを取得
 	for page := 1; page <= MaxPages; page++ {
 		doc, err := fetchHTML(page)
 		if err != nil {
@@ -238,122 +330,115 @@ func processLatestNews(postedURLs []PostedURL) ([]PostedURL, error) {
 			break
 		}
 
-		kumaInfos := parseArticles(doc, page)
-		if len(kumaInfos) == 0 && page > 1 {
+		articles := parseArticles(doc, page)
+		if len(articles) == 0 && page > 1 {
 			log.Printf("No articles found on page %d, stopping", page)
 			break
 		}
 
-		allKumaInfos = append(allKumaInfos, kumaInfos...)
+		allArticles = append(allArticles, articles...)
 	}
 
-	// 投稿済みでない記事のみをフィルタリング
 	var newPostedURLs []PostedURL
-	for _, info := range allKumaInfos {
-		if _, exists := postedURLMap[info.URL]; !exists {
-			newPostedURLs = append(newPostedURLs, *info)
+	for _, article := range allArticles {
+		if _, exists := existingURLMap[article.URL]; !exists {
+			newPostedURLs = append(newPostedURLs, *article)
 		}
 	}
 
-	// 古い順でソート（PublishedAtを使用）
 	sort.Slice(newPostedURLs, func(i, j int) bool {
 		return newPostedURLs[i].PublishedAt.Before(newPostedURLs[j].PublishedAt)
 	})
 
 	log.Printf("Found %d new kuma news items (total %d, already posted %d)",
-		len(newPostedURLs), len(allKumaInfos), len(allKumaInfos)-len(newPostedURLs))
+		len(newPostedURLs), len(allArticles), len(allArticles)-len(newPostedURLs))
 
 	return newPostedURLs, nil
 }
 
-// fetchHTML クマニュースのHTMLを取得
 func fetchHTML(page int) (*goquery.Document, error) {
-	httpClient := &http.Client{Timeout: 30 * time.Second}
+	client := &http.Client{Timeout: HTTPTimeout}
+	url := fmt.Sprintf("%s?page=%d", kumaNewsURL, page)
 
-	resp, err := httpClient.Get(fmt.Sprintf("%s?page=%d", kumaNewsURL, page))
+	resp, err := client.Get(url)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to fetch page %d from %s: %w", page, kumaNewsURL, err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode == http.StatusNotFound {
-		return nil, fmt.Errorf("page not found")
+		return nil, fmt.Errorf("page %d not found (404)", page)
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("HTTP error: %d", resp.StatusCode)
+		return nil, fmt.Errorf("HTTP error %d when fetching page %d", resp.StatusCode, page)
 	}
 
 	doc, err := goquery.NewDocumentFromReader(resp.Body)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to parse HTML from page %d: %w", page, err)
 	}
 
 	return doc, nil
 }
 
-// parseArticles HTMLから記事を解析
 func parseArticles(doc *goquery.Document, page int) []*PostedURL {
-	var kumaInfos []*PostedURL
-	var totalArticles int
+	var articles []*PostedURL
 
 	doc.Find("li.h-bm02").Each(func(i int, s *goquery.Selection) {
-		// 広告要素をスキップ
 		if s.Find("div[data-allox-placement]").Length() > 0 {
 			return
 		}
 
-		totalArticles++
-
-		// 記事情報を取得
-		thumbsListUnit := s.Find("div.thumbsListUnit")
-		newsListSupplement := thumbsListUnit.Find("p.newsListSupplement")
-		dateText := strings.TrimSpace(newsListSupplement.Find("span.newsDate").Text())
-		timeText := strings.TrimSpace(newsListSupplement.Find("span.newsTime").Text())
-
-		timestamp, err := parseDateTime(dateText, timeText)
-		if err != nil {
-			log.Printf("Skipping article on page %d due to datetime parse error: %v", page, err)
-			return
+		article := extractArticleInfo(s, page)
+		if article != nil {
+			articles = append(articles, article)
 		}
-
-		title := strings.TrimSpace(thumbsListUnit.Find("h3.thumbsListTitle").Text())
-		href, _ := thumbsListUnit.Find("h3.thumbsListTitle").Closest("a").Attr("href")
-		source := strings.TrimSpace(newsListSupplement.Find("span.newsTenter").Text())
-		region := strings.TrimSpace(s.Find("ul.topics-keywords li a").Text())
-
-		kumaInfos = append(kumaInfos, &PostedURL{
-			Title:       title,
-			URL:         href,
-			Description: fmt.Sprintf("%s %s %s %s", region, source, dateText, timeText),
-			PublishedAt: timestamp,
-		})
 	})
 
-	return kumaInfos
+	return articles
 }
 
-// parseDateTime 日付と時刻文字列をtime.Timeに変換
+func extractArticleInfo(s *goquery.Selection, page int) *PostedURL {
+	thumbsListUnit := s.Find("div.thumbsListUnit")
+	newsListSupplement := thumbsListUnit.Find("p.newsListSupplement")
+	dateText := strings.TrimSpace(newsListSupplement.Find("span.newsDate").Text())
+	timeText := strings.TrimSpace(newsListSupplement.Find("span.newsTime").Text())
+
+	timestamp, err := parseDateTime(dateText, timeText)
+	if err != nil {
+		log.Printf("Skipping article on page %d due to datetime parse error: %v", page, err)
+		return nil
+	}
+
+	title := strings.TrimSpace(thumbsListUnit.Find("h3.thumbsListTitle").Text())
+	href, _ := thumbsListUnit.Find("h3.thumbsListTitle").Closest("a").Attr("href")
+	source := strings.TrimSpace(newsListSupplement.Find("span.newsTenter").Text())
+	region := strings.TrimSpace(s.Find("ul.topics-keywords li a").Text())
+
+	return &PostedURL{
+		Title:       title,
+		URL:         href,
+		Description: fmt.Sprintf("%s %s %s %s", region, source, dateText, timeText),
+		PublishedAt: timestamp,
+	}
+}
+
 func parseDateTime(dateText, timeText string) (time.Time, error) {
-	// 日本時間のタイムゾーンを設定
-	jst := time.FixedZone("JST", 9*60*60)
+	jst := time.FixedZone("JST", JSTOffset)
 	nowJST := time.Now().In(jst)
 
-	// 日付から曜日部分を除去 (例: "10/31(金)" -> "10/31")
 	if idx := strings.Index(dateText, "("); idx > 0 {
 		dateText = dateText[:idx]
 	}
 
-	// 現在の年を使って日時文字列を作成
 	dateTimeStr := fmt.Sprintf("%d/%s %s", nowJST.Year(), dateText, timeText)
 
-	// 日本時間として解析
 	parsedTime, err := time.ParseInLocation("2006/1/2 15:4", dateTimeStr, jst)
 	if err != nil {
 		return time.Time{}, fmt.Errorf("failed to parse datetime '%s %s': %v", dateText, timeText, err)
 	}
 
-	// 年跨ぎ問題の対処: パースした日付が未来になる場合は前年の日付とする
 	if parsedTime.After(nowJST) {
 		dateTimeStr = fmt.Sprintf("%d/%s %s", nowJST.Year()-1, dateText, timeText)
 		parsedTime, err = time.ParseInLocation("2006/1/2 15:4", dateTimeStr, jst)
@@ -365,77 +450,165 @@ func parseDateTime(dateText, timeText string) (time.Time, error) {
 	return parsedTime, nil
 }
 
-// postToMastodon PostedURLをMastodonに投稿し、成功したURLを返す
-func postToMastodon(ctx context.Context, config *Config, postedURLs []PostedURL) []PostedURL {
-	// Mastodon設定を作成
-	mastodonConfig := &mastodon.Config{
-		Server:       config.Mastodon.Server,
-		ClientID:     config.Mastodon.ClientID,
-		ClientSecret: config.Mastodon.ClientSecret,
-		AccessToken:  config.Mastodon.AccessToken,
-	}
-
-	// Mastodonクライアントを作成
-	client := mastodon.NewClient(mastodonConfig)
-
+func postToMastodon(ctx context.Context, config *Config, client *mastodon.Client, articles []PostedURL) []PostedURL {
 	var successfullyPosted []PostedURL
-	for i, posted := range postedURLs {
-		// 投稿テキストを生成
-		post := fmt.Sprintf(`🐻 %s
-
-🔗 %s
-
-📍 %s
-
-#クマ出没情報`, posted.Title, posted.URL, posted.Description)
-
-		_, err := client.PostStatus(ctx, &mastodon.Toot{
-			Status:     post,
-			Visibility: "unlisted",
-		})
-		if err != nil {
-			log.Printf("Failed to post: %s - %v", posted.Title, err)
-		} else {
-			// 投稿成功時に投稿時刻を設定
-			posted.PostedAt = time.Now()
-			successfullyPosted = append(successfullyPosted, posted)
+	for i, article := range articles {
+		success := postSingleArticle(ctx, config, client, &article)
+		if success {
+			article.PostedAt = time.Now()
+			successfullyPosted = append(successfullyPosted, article)
 		}
 
-		// 最後の投稿以外は0.2秒待機
-		if i < len(postedURLs)-1 {
-			time.Sleep(200 * time.Millisecond)
+		if i < len(articles)-1 {
+			time.Sleep(PostDelay)
 		}
 	}
 
-	log.Printf("Successfully posted %d out of %d posts", len(successfullyPosted), len(postedURLs))
+	log.Printf("Successfully posted %d out of %d articles", len(successfullyPosted), len(articles))
 	return successfullyPosted
 }
 
-// savePostedURLs 投稿済みURLをS3に保存
-func savePostedURLs(ctx context.Context, appConfig *Config, postedURLs []PostedURL) error {
-	cfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(appConfig.AWS.Region))
-	if err != nil {
-		return fmt.Errorf("failed to load AWS config: %v", err)
-	}
+func postSingleArticle(ctx context.Context, config *Config, client *mastodon.Client, article *PostedURL) bool {
+	post := fmt.Sprintf(KumaPostTemplate, article.Title, article.URL, article.Description)
 
-	svc := s3.NewFromConfig(cfg)
-
-	data, err := json.MarshalIndent(postedURLs, "", "    ")
-	if err != nil {
-		return fmt.Errorf("failed to marshal posted URLs: %v", err)
-	}
-
-	contentType := "application/json"
-	_, err = svc.PutObject(ctx, &s3.PutObjectInput{
-		Bucket:      aws.String(appConfig.AWS.S3.BucketName),
-		Key:         aws.String(appConfig.AWS.S3.ObjectKey),
-		Body:        bytes.NewReader(data),
-		ContentType: &contentType,
+	_, err := client.PostStatus(ctx, &mastodon.Toot{
+		Status:     post,
+		Visibility: config.Mastodon.Visibility,
 	})
 	if err != nil {
-		return fmt.Errorf("failed to put object to S3: %v", err)
+		log.Printf("Failed to post article '%s': %v", article.Title, err)
+		return false
 	}
 
-	log.Printf("Saved %d posted URLs to S3", len(postedURLs))
+	log.Printf("Successfully posted article: %s", article.Title)
+	return true
+}
+
+func runPrefectureSummary(ctx context.Context, config *Config, client *mastodon.Client) error {
+	toots, err := fetchRecentToots(ctx, client)
+	if err != nil {
+		return fmt.Errorf("failed to fetch recent toots: %w", err)
+	}
+
+	log.Printf("Fetched %d toots from the past 24 hours", len(toots))
+
+	prefectureStats := aggregatePrefectures(toots)
+
+	if err := postPrefectureSummary(ctx, config, client, prefectureStats, len(toots)); err != nil {
+		return fmt.Errorf("failed to post prefecture summary: %w", err)
+	}
+
+	return nil
+}
+
+func fetchRecentToots(ctx context.Context, client *mastodon.Client) ([]*mastodon.Status, error) {
+	jst := time.FixedZone("JST", JSTOffset)
+	now := time.Now().In(jst)
+	since := now.Add(-24 * time.Hour)
+
+	account, err := client.GetAccountCurrentUser(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get current account: %w", err)
+	}
+
+	var allToots []*mastodon.Status
+	maxID := ""
+
+	for {
+		var toots []*mastodon.Status
+
+		if maxID != "" {
+			toots, err = client.GetAccountStatuses(ctx, account.ID, &mastodon.Pagination{
+				MaxID: mastodon.ID(maxID),
+				Limit: TootFetchLimit,
+			})
+		} else {
+			toots, err = client.GetAccountStatuses(ctx, account.ID, &mastodon.Pagination{
+				Limit: TootFetchLimit,
+			})
+		}
+
+		if err != nil {
+			return nil, fmt.Errorf("failed to fetch account statuses: %w", err)
+		}
+
+		if len(toots) == 0 {
+			break
+		}
+
+		for _, toot := range toots {
+			if toot.CreatedAt.After(since) {
+				allToots = append(allToots, toot)
+			} else {
+				return allToots, nil
+			}
+		}
+
+		maxID = string(toots[len(toots)-1].ID)
+	}
+
+	log.Printf("Fetched %d toots from the past 24 hours", len(allToots))
+	return allToots, nil
+}
+
+func aggregatePrefectures(toots []*mastodon.Status) []PrefectureCount {
+	prefectureCountMap := make(map[string]int)
+	prefectureRegex := regexp.MustCompile(prefecturePattern)
+
+	for _, toot := range toots {
+		matches := prefectureRegex.FindStringSubmatch(toot.Content)
+		if len(matches) > 1 {
+			location := strings.TrimSpace(matches[1])
+
+			prefecture := extractPrefecture(location)
+			if prefecture != "" {
+				prefectureCountMap[prefecture]++
+			} else {
+				prefectureCountMap["その他"]++
+			}
+		}
+	}
+
+	var results []PrefectureCount
+	for prefecture, count := range prefectureCountMap {
+		results = append(results, PrefectureCount{
+			Prefecture: prefecture,
+			Count:      count,
+		})
+	}
+
+	sort.Slice(results, func(i, j int) bool {
+		if results[i].Count == results[j].Count {
+			return results[i].Prefecture < results[j].Prefecture
+		}
+		return results[i].Count > results[j].Count
+	})
+
+	return results
+}
+
+func postPrefectureSummary(ctx context.Context, config *Config, client *mastodon.Client, stats []PrefectureCount, totalPosts int) error {
+	postContent := fmt.Sprintf(SummaryPostTemplate, totalPosts, formatPrefectureStats(stats))
+	log.Printf("Posting prefecture summary for %d total posts covering %d prefectures", totalPosts, len(stats))
+
+	if _, err := client.PostStatus(ctx, &mastodon.Toot{
+		Status:     postContent,
+		Visibility: config.Mastodon.Visibility,
+	}); err != nil {
+		return fmt.Errorf("failed to post prefecture summary: %w", err)
+	}
+
+	log.Printf("Successfully posted prefecture summary with top prefecture: %s (%d posts)",
+		func() string {
+			if len(stats) > 0 {
+				return stats[0].Prefecture
+			}
+			return "N/A"
+		}(), func() int {
+			if len(stats) > 0 {
+				return stats[0].Count
+			}
+			return 0
+		}())
 	return nil
 }
