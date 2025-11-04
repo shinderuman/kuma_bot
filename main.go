@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"flag"
 	"fmt"
 	"io"
 	"log"
@@ -97,16 +96,11 @@ type PrefectureCount struct {
 	Count      int    `json:"count"`
 }
 
-
 func main() {
 	if isLambda() {
 		lambda.Start(handleKumaBotRequest)
 	} else {
-		var summaryMode bool
-		flag.BoolVar(&summaryMode, "summary", false, "run summary mode")
-		flag.Parse()
-
-		if err := handleKumaBotRequest(context.Background(), summaryMode); err != nil {
+		if err := handleKumaBotRequest(context.Background()); err != nil {
 			log.Fatal(err)
 		}
 	}
@@ -141,7 +135,7 @@ func formatPrefectureStats(stats []PrefectureCount) string {
 	return strings.Join(lines, "\n")
 }
 
-func handleKumaBotRequest(ctx context.Context, summaryMode bool) error {
+func handleKumaBotRequest(ctx context.Context) error {
 	config, err := loadConfig()
 	if err != nil {
 		return fmt.Errorf("failed to load config: %w", err)
@@ -149,7 +143,7 @@ func handleKumaBotRequest(ctx context.Context, summaryMode bool) error {
 
 	client := NewMastodonClient(config)
 
-	if summaryMode || (isLambda() && isMidnightJST()) {
+	if isMidnightJST() {
 		log.Println("Starting prefecture summary mode")
 		if err := runPrefectureSummary(ctx, config, client); err != nil {
 			return fmt.Errorf("failed to run prefecture summary: %w", err)
