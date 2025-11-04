@@ -61,6 +61,9 @@ Lambda実行ロールには以下の権限が必要です：
 ```bash
 # 通常モード実行
 go run main.go
+
+# 集計モードを実行（強制的に集計と通常モード両方実行）
+KUMA_FORCE_SUMMARY=1 go run main.go
 ```
 
 ### Lambda デプロイ
@@ -76,8 +79,9 @@ go run main.go
 ./deploy.sh my-profile my-function-name
 ```
 
-## 環境変数（Lambda環境）
+## 環境変数
 
+### Lambda環境
 Lambda環境では以下の環境変数を設定してください：
 
 - `MASTODON_SERVER` - MastodonサーバーのURL
@@ -90,6 +94,11 @@ Lambda環境では以下の環境変数を設定してください：
 - `KUMA_AWS_REGION` - AWSリージョン（オプション、`AWS_REGION`が優先される）
 
 **注意**: `KUMA_AWS_REGION`を設定することで、Lambda環境でもカスタムリージョンを指定できます。設定しない場合は`AWS_REGION`（Lambda予約済み環境変数）が使用されます。
+
+### ローカル実行（オプション）
+ローカルでテスト用に使用できる環境変数：
+
+- `KUMA_FORCE_SUMMARY` - 集計モードを強制実行（空以外の値で有効）
 
 ## 設定
 

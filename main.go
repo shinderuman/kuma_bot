@@ -143,7 +143,7 @@ func handleKumaBotRequest(ctx context.Context) error {
 
 	client := NewMastodonClient(config)
 
-	if isMidnightJST() {
+	if isMidnightJST() || os.Getenv("KUMA_FORCE_SUMMARY") != "" {
 		log.Println("Starting prefecture summary mode")
 		if err := runPrefectureSummary(ctx, config, client); err != nil {
 			return fmt.Errorf("failed to run prefecture summary: %w", err)
