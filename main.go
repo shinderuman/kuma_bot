@@ -24,7 +24,7 @@ import (
 )
 
 const (
-	kumaNewsURL            = "https://topics.smt.docomo.ne.jp/latestnews/keywords/592c8cd81446273da9280cdf06875ec2347a5b3bd970bca305d5cb869e7c4161"
+	KumaNewsURL            = "https://topics.smt.docomo.ne.jp/latestnews/keywords/592c8cd81446273da9280cdf06875ec2347a5b3bd970bca305d5cb869e7c4161"
 	MaxPages               = 3
 	PostedURLRetentionDays = 30
 	TootFetchLimit         = 40
@@ -44,9 +44,7 @@ const (
 %s
 
 #クマ出没情報`
-)
 
-const (
 	prefecturePattern = `📍\s*([^\n📍]+)`
 )
 
@@ -352,11 +350,11 @@ func processLatestNews(existingURLs []PostedURL) ([]PostedURL, error) {
 
 func fetchHTML(page int) (*goquery.Document, error) {
 	client := &http.Client{Timeout: HTTPTimeout}
-	url := fmt.Sprintf("%s?page=%d", kumaNewsURL, page)
+	url := fmt.Sprintf("%s?page=%d", KumaNewsURL, page)
 
 	resp, err := client.Get(url)
 	if err != nil {
-		return nil, fmt.Errorf("failed to fetch page %d from %s: %w", page, kumaNewsURL, err)
+		return nil, fmt.Errorf("failed to fetch page %d from %s: %w", page, KumaNewsURL, err)
 	}
 	defer resp.Body.Close()
 
