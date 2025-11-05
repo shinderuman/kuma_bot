@@ -108,38 +108,13 @@ func isLambda() bool {
 	return len(os.Getenv("AWS_LAMBDA_FUNCTION_NAME")) > 0
 }
 
-func isMidnightJST() bool {
-	jst := time.FixedZone("JST", JSTOffset)
-	now := time.Now().In(jst)
-
-	return now.Hour() == 0 && now.Minute() == 0
-}
-
-func extractPrefecture(text string) string {
-	for _, prefecture := range prefectures {
-		if strings.Contains(text, prefecture) {
-			return prefecture
-		}
-	}
-
-	return ""
-}
-
-func formatPrefectureStats(stats []PrefectureCount) string {
-	var lines []string
-	for i, stat := range stats {
-		lines = append(lines, fmt.Sprintf("%d. %s：%d件", i+1, stat.Prefecture, stat.Count))
-	}
-	return strings.Join(lines, "\n")
-}
-
 func handleKumaBotRequest(ctx context.Context) error {
 	config, err := loadConfig()
 	if err != nil {
 		return fmt.Errorf("failed to load config: %w", err)
 	}
 
-	client := NewMastodonClient(config)
+	client := newMastodonClient(config)
 
 	if isMidnightJST() || os.Getenv("KUMA_FORCE_SUMMARY") != "" {
 		log.Println("Starting prefecture summary mode")
@@ -154,10 +129,8 @@ func handleKumaBotRequest(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("failed to load posted URLs: %w", err)
 	}
-	log.Printf("Loaded %d existing URLs from storage", len(existingURLs))
 
 	existingURLs = cleanupOldURLs(existingURLs)
-	log.Printf("After cleanup, %d URLs remain", len(existingURLs))
 
 	newPostedURLs, err := processLatestNews(existingURLs)
 	if err != nil {
@@ -166,13 +139,10 @@ func handleKumaBotRequest(ctx context.Context) error {
 
 	if len(newPostedURLs) > 0 {
 		successfullyPostedURLs := postToMastodon(ctx, config, client, newPostedURLs)
-		log.Printf("Successfully posted %d new articles", len(successfullyPostedURLs))
 
 		if err := savePostedURLs(ctx, config, append(existingURLs, successfullyPostedURLs...)); err != nil {
 			return fmt.Errorf("failed to save posted URLs: %w", err)
 		}
-	} else {
-		log.Println("No new articles found to post")
 	}
 
 	return nil
@@ -223,13 +193,35 @@ func getAWSRegion() string {
 	return "ap-northeast-1"
 }
 
-func NewMastodonClient(config *Config) *mastodon.Client {
+func newMastodonClient(config *Config) *mastodon.Client {
 	return mastodon.NewClient(&mastodon.Config{
 		Server:       config.Mastodon.Server,
 		ClientID:     config.Mastodon.ClientID,
 		ClientSecret: config.Mastodon.ClientSecret,
 		AccessToken:  config.Mastodon.AccessToken,
 	})
+}
+
+func isMidnightJST() bool {
+	jst := time.FixedZone("JST", JSTOffset)
+	now := time.Now().In(jst)
+
+	return now.Hour() == 0 && now.Minute() == 0
+}
+
+func runPrefectureSummary(ctx context.Context, config *Config, client *mastodon.Client) error {
+	toots, err := fetchRecentToots(ctx, client)
+	if err != nil {
+		return fmt.Errorf("failed to fetch recent toots: %w", err)
+	}
+
+	prefectureStats := aggregatePrefectures(toots)
+
+	if err := postPrefectureSummary(ctx, config, client, prefectureStats, len(toots)); err != nil {
+		return fmt.Errorf("failed to post prefecture summary: %w", err)
+	}
+
+	return nil
 }
 
 func loadPostedURLs(ctx context.Context, appConfig *Config) ([]PostedURL, error) {
@@ -259,36 +251,7 @@ func loadPostedURLs(ctx context.Context, appConfig *Config) ([]PostedURL, error)
 		return nil, fmt.Errorf("failed to unmarshal posted URLs: %w", err)
 	}
 
-	log.Printf("Loaded %d posted URLs from S3", len(postedURLs))
 	return postedURLs, nil
-}
-
-func savePostedURLs(ctx context.Context, appConfig *Config, postedURLs []PostedURL) error {
-	cfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(appConfig.AWS.Region))
-	if err != nil {
-		return fmt.Errorf("failed to load AWS config: %w", err)
-	}
-
-	svc := s3.NewFromConfig(cfg)
-
-	data, err := json.MarshalIndent(postedURLs, "", "    ")
-	if err != nil {
-		return fmt.Errorf("failed to marshal posted URLs: %w", err)
-	}
-
-	contentType := "application/json"
-	_, err = svc.PutObject(ctx, &s3.PutObjectInput{
-		Bucket:      aws.String(appConfig.AWS.S3.BucketName),
-		Key:         aws.String(appConfig.AWS.S3.ObjectKey),
-		Body:        bytes.NewReader(data),
-		ContentType: &contentType,
-	})
-	if err != nil {
-		return fmt.Errorf("failed to put object to S3: %w", err)
-	}
-
-	log.Printf("Saved %d posted URLs to S3", len(postedURLs))
-	return nil
 }
 
 func cleanupOldURLs(existingURLs []PostedURL) []PostedURL {
@@ -342,10 +305,154 @@ func processLatestNews(existingURLs []PostedURL) ([]PostedURL, error) {
 		return newPostedURLs[i].PublishedAt.Before(newPostedURLs[j].PublishedAt)
 	})
 
-	log.Printf("Found %d new kuma news items (total %d, already posted %d)",
-		len(newPostedURLs), len(allArticles), len(allArticles)-len(newPostedURLs))
-
 	return newPostedURLs, nil
+}
+
+func postToMastodon(ctx context.Context, config *Config, client *mastodon.Client, articles []PostedURL) []PostedURL {
+	var successfullyPosted []PostedURL
+	for i, article := range articles {
+		success := postSingleArticle(ctx, config, client, &article)
+		if success {
+			article.PostedAt = time.Now()
+			successfullyPosted = append(successfullyPosted, article)
+		}
+
+		if i < len(articles)-1 {
+			time.Sleep(PostDelay)
+		}
+	}
+
+	return successfullyPosted
+}
+
+func savePostedURLs(ctx context.Context, appConfig *Config, postedURLs []PostedURL) error {
+	cfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(appConfig.AWS.Region))
+	if err != nil {
+		return fmt.Errorf("failed to load AWS config: %w", err)
+	}
+
+	svc := s3.NewFromConfig(cfg)
+
+	data, err := json.MarshalIndent(postedURLs, "", "    ")
+	if err != nil {
+		return fmt.Errorf("failed to marshal posted URLs: %w", err)
+	}
+
+	contentType := "application/json"
+	_, err = svc.PutObject(ctx, &s3.PutObjectInput{
+		Bucket:      aws.String(appConfig.AWS.S3.BucketName),
+		Key:         aws.String(appConfig.AWS.S3.ObjectKey),
+		Body:        bytes.NewReader(data),
+		ContentType: &contentType,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to put object to S3: %w", err)
+	}
+
+	return nil
+}
+
+func fetchRecentToots(ctx context.Context, client *mastodon.Client) ([]*mastodon.Status, error) {
+	jst := time.FixedZone("JST", JSTOffset)
+	now := time.Now().In(jst)
+	since := now.Add(-24 * time.Hour)
+
+	account, err := client.GetAccountCurrentUser(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get current account: %w", err)
+	}
+
+	var allToots []*mastodon.Status
+	maxID := ""
+
+	for {
+		var toots []*mastodon.Status
+
+		if maxID != "" {
+			toots, err = client.GetAccountStatuses(ctx, account.ID, &mastodon.Pagination{
+				MaxID: mastodon.ID(maxID),
+				Limit: TootFetchLimit,
+			})
+		} else {
+			toots, err = client.GetAccountStatuses(ctx, account.ID, &mastodon.Pagination{
+				Limit: TootFetchLimit,
+			})
+		}
+
+		if err != nil {
+			return nil, fmt.Errorf("failed to fetch account statuses: %w", err)
+		}
+
+		if len(toots) == 0 {
+			break
+		}
+
+		for _, toot := range toots {
+			if toot.CreatedAt.After(since) {
+				allToots = append(allToots, toot)
+			} else {
+				return allToots, nil
+			}
+		}
+
+		maxID = string(toots[len(toots)-1].ID)
+	}
+
+	return allToots, nil
+}
+
+func aggregatePrefectures(toots []*mastodon.Status) []PrefectureCount {
+	prefectureCountMap := make(map[string]int)
+	prefectureRegex := regexp.MustCompile(prefecturePattern)
+
+	var otherCount int
+	for _, toot := range toots {
+		matches := prefectureRegex.FindStringSubmatch(toot.Content)
+		if len(matches) > 1 {
+			location := strings.TrimSpace(matches[1])
+
+			prefecture := extractPrefecture(location)
+			if prefecture != "" {
+				prefectureCountMap[prefecture]++
+			} else {
+				otherCount++
+			}
+		}
+	}
+
+	var results []PrefectureCount
+	for prefecture, count := range prefectureCountMap {
+		results = append(results, PrefectureCount{
+			Prefecture: prefecture,
+			Count:      count,
+		})
+	}
+
+	sort.Slice(results, func(i, j int) bool {
+		if results[i].Count == results[j].Count {
+			return results[i].Prefecture < results[j].Prefecture
+		}
+		return results[i].Count > results[j].Count
+	})
+
+	if otherCount > 0 {
+		results = append(results, PrefectureCount{
+			Prefecture: "その他",
+			Count:      otherCount,
+		})
+	}
+
+	return results
+}
+
+func postPrefectureSummary(ctx context.Context, config *Config, client *mastodon.Client, stats []PrefectureCount, totalPosts int) error {
+	postContent := fmt.Sprintf(SummaryPostTemplate, totalPosts, formatPrefectureStats(stats))
+
+	if err := postToMastodonWithContent(ctx, config, client, postContent); err != nil {
+		return fmt.Errorf("failed to post prefecture summary: %w", err)
+	}
+
+	return nil
 }
 
 func fetchHTML(page int) (*goquery.Document, error) {
@@ -416,6 +523,48 @@ func extractArticleInfo(s *goquery.Selection, page int) *PostedURL {
 	}
 }
 
+func postSingleArticle(ctx context.Context, config *Config, client *mastodon.Client, article *PostedURL) bool {
+	post := fmt.Sprintf(KumaPostTemplate, article.Title, article.URL, article.Description)
+
+	if err := postToMastodonWithContent(ctx, config, client, post); err != nil {
+		log.Printf("Failed to post article '%s': %v", article.Title, err)
+		return false
+	}
+
+	return true
+}
+
+func postToMastodonWithContent(ctx context.Context, config *Config, client *mastodon.Client, content string) error {
+	_, err := client.PostStatus(ctx, &mastodon.Toot{
+		Status:     content,
+		Visibility: config.Mastodon.Visibility,
+	})
+	if err != nil {
+		log.Printf("Failed to post content to Mastodon:\n%s\nError: %v", content, err)
+		return fmt.Errorf("failed to post to Mastodon: %w", err)
+	}
+
+	return nil
+}
+
+func extractPrefecture(text string) string {
+	for _, prefecture := range prefectures {
+		if strings.Contains(text, prefecture) {
+			return prefecture
+		}
+	}
+
+	return ""
+}
+
+func formatPrefectureStats(stats []PrefectureCount) string {
+	var lines []string
+	for i, stat := range stats {
+		lines = append(lines, fmt.Sprintf("%d. %s：%d件", i+1, stat.Prefecture, stat.Count))
+	}
+	return strings.Join(lines, "\n")
+}
+
 func parseDateTime(dateText, timeText string) (time.Time, error) {
 	jst := time.FixedZone("JST", JSTOffset)
 	nowJST := time.Now().In(jst)
@@ -440,167 +589,4 @@ func parseDateTime(dateText, timeText string) (time.Time, error) {
 	}
 
 	return parsedTime, nil
-}
-
-func postToMastodon(ctx context.Context, config *Config, client *mastodon.Client, articles []PostedURL) []PostedURL {
-	var successfullyPosted []PostedURL
-	for i, article := range articles {
-		success := postSingleArticle(ctx, config, client, &article)
-		if success {
-			article.PostedAt = time.Now()
-			successfullyPosted = append(successfullyPosted, article)
-		}
-
-		if i < len(articles)-1 {
-			time.Sleep(PostDelay)
-		}
-	}
-
-	log.Printf("Successfully posted %d out of %d articles", len(successfullyPosted), len(articles))
-	return successfullyPosted
-}
-
-func postSingleArticle(ctx context.Context, config *Config, client *mastodon.Client, article *PostedURL) bool {
-	post := fmt.Sprintf(KumaPostTemplate, article.Title, article.URL, article.Description)
-
-	_, err := client.PostStatus(ctx, &mastodon.Toot{
-		Status:     post,
-		Visibility: config.Mastodon.Visibility,
-	})
-	if err != nil {
-		log.Printf("Failed to post article '%s': %v", article.Title, err)
-		return false
-	}
-
-	log.Printf("Successfully posted article: %s", article.Title)
-	return true
-}
-
-func runPrefectureSummary(ctx context.Context, config *Config, client *mastodon.Client) error {
-	toots, err := fetchRecentToots(ctx, client)
-	if err != nil {
-		return fmt.Errorf("failed to fetch recent toots: %w", err)
-	}
-
-	log.Printf("Fetched %d toots from the past 24 hours", len(toots))
-
-	prefectureStats := aggregatePrefectures(toots)
-
-	if err := postPrefectureSummary(ctx, config, client, prefectureStats, len(toots)); err != nil {
-		return fmt.Errorf("failed to post prefecture summary: %w", err)
-	}
-
-	return nil
-}
-
-func fetchRecentToots(ctx context.Context, client *mastodon.Client) ([]*mastodon.Status, error) {
-	jst := time.FixedZone("JST", JSTOffset)
-	now := time.Now().In(jst)
-	since := now.Add(-24 * time.Hour)
-
-	account, err := client.GetAccountCurrentUser(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get current account: %w", err)
-	}
-
-	var allToots []*mastodon.Status
-	maxID := ""
-
-	for {
-		var toots []*mastodon.Status
-
-		if maxID != "" {
-			toots, err = client.GetAccountStatuses(ctx, account.ID, &mastodon.Pagination{
-				MaxID: mastodon.ID(maxID),
-				Limit: TootFetchLimit,
-			})
-		} else {
-			toots, err = client.GetAccountStatuses(ctx, account.ID, &mastodon.Pagination{
-				Limit: TootFetchLimit,
-			})
-		}
-
-		if err != nil {
-			return nil, fmt.Errorf("failed to fetch account statuses: %w", err)
-		}
-
-		if len(toots) == 0 {
-			break
-		}
-
-		for _, toot := range toots {
-			if toot.CreatedAt.After(since) {
-				allToots = append(allToots, toot)
-			} else {
-				return allToots, nil
-			}
-		}
-
-		maxID = string(toots[len(toots)-1].ID)
-	}
-
-	log.Printf("Fetched %d toots from the past 24 hours", len(allToots))
-	return allToots, nil
-}
-
-func aggregatePrefectures(toots []*mastodon.Status) []PrefectureCount {
-	prefectureCountMap := make(map[string]int)
-	prefectureRegex := regexp.MustCompile(prefecturePattern)
-
-	for _, toot := range toots {
-		matches := prefectureRegex.FindStringSubmatch(toot.Content)
-		if len(matches) > 1 {
-			location := strings.TrimSpace(matches[1])
-
-			prefecture := extractPrefecture(location)
-			if prefecture != "" {
-				prefectureCountMap[prefecture]++
-			} else {
-				prefectureCountMap["その他"]++
-			}
-		}
-	}
-
-	var results []PrefectureCount
-	for prefecture, count := range prefectureCountMap {
-		results = append(results, PrefectureCount{
-			Prefecture: prefecture,
-			Count:      count,
-		})
-	}
-
-	sort.Slice(results, func(i, j int) bool {
-		if results[i].Count == results[j].Count {
-			return results[i].Prefecture < results[j].Prefecture
-		}
-		return results[i].Count > results[j].Count
-	})
-
-	return results
-}
-
-func postPrefectureSummary(ctx context.Context, config *Config, client *mastodon.Client, stats []PrefectureCount, totalPosts int) error {
-	postContent := fmt.Sprintf(SummaryPostTemplate, totalPosts, formatPrefectureStats(stats))
-	log.Printf("Posting prefecture summary for %d total posts covering %d prefectures", totalPosts, len(stats))
-
-	if _, err := client.PostStatus(ctx, &mastodon.Toot{
-		Status:     postContent,
-		Visibility: config.Mastodon.Visibility,
-	}); err != nil {
-		return fmt.Errorf("failed to post prefecture summary: %w", err)
-	}
-
-	log.Printf("Successfully posted prefecture summary with top prefecture: %s (%d posts)",
-		func() string {
-			if len(stats) > 0 {
-				return stats[0].Prefecture
-			}
-			return "N/A"
-		}(), func() int {
-			if len(stats) > 0 {
-				return stats[0].Count
-			}
-			return 0
-		}())
-	return nil
 }
