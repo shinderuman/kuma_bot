@@ -11,6 +11,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/aws/aws-lambda-go/lambda"
@@ -66,6 +67,13 @@ var (
 		"徳島県", "香川県", "愛媛県", "高知県", "福岡県", "佐賀県", "長崎県",
 		"熊本県", "大分県", "宮崎県", "鹿児島県", "沖縄県",
 	}
+)
+
+// RSS設定のグローバル変数
+var (
+	rssConfig     *RSSConfig
+	rssConfigOnce sync.Once
+	rssConfigErr  error
 )
 
 type MastodonConfig struct {
@@ -227,16 +235,19 @@ func getAWSRegion() string {
 }
 
 func loadRSSConfig(ctx context.Context, appConfig *Config) (*RSSConfig, error) {
-	if appConfig.AWS.S3.RSSConfigKey == "" {
-		return nil, fmt.Errorf("RSS config key not specified in config")
-	}
-
-	var rssConfig RSSConfig
-	if err := loadJSONFromS3(ctx, appConfig, appConfig.AWS.S3.RSSConfigKey, &rssConfig); err != nil {
-		return nil, fmt.Errorf("failed to load RSS config: %w", err)
-	}
-
-	return &rssConfig, nil
+	rssConfigOnce.Do(func() {
+		if appConfig.AWS.S3.RSSConfigKey == "" {
+			rssConfigErr = fmt.Errorf("RSS config key not specified in config")
+			return
+		}
+		var config RSSConfig
+		if err := loadJSONFromS3(ctx, appConfig, appConfig.AWS.S3.RSSConfigKey, &config); err != nil {
+			rssConfigErr = fmt.Errorf("failed to load RSS config: %w", err)
+			return
+		}
+		rssConfig = &config
+	})
+	return rssConfig, rssConfigErr
 }
 
 func loadPostedURLs(ctx context.Context, appConfig *Config) ([]PostedURL, error) {
