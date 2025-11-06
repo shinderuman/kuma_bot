@@ -38,7 +38,7 @@ const (
 📍 %s
 
 #クマ出没情報`
-	SummaryPostTemplate = `🐻 昨日のクマ出没情報集計（全%d件）
+	SummaryPostTemplate = `🐻 %sのクマ出没情報集計（全%d件）
 
 📍 都道府県別ランキング:
 %s
@@ -210,14 +210,17 @@ func isMidnightJST() bool {
 }
 
 func runPrefectureSummary(ctx context.Context, config *Config, client *mastodon.Client) error {
-	toots, err := fetchRecentToots(ctx, client)
+	jst := time.FixedZone("JST", JSTOffset)
+	yesterday := time.Now().In(jst).AddDate(0, 0, -1)
+
+	toots, err := fetchRecentToots(ctx, client, yesterday)
 	if err != nil {
 		return fmt.Errorf("failed to fetch recent toots: %w", err)
 	}
 
 	prefectureStats := aggregatePrefectures(toots)
 
-	if err := postPrefectureSummary(ctx, config, client, prefectureStats, len(toots)); err != nil {
+	if err := postPrefectureSummary(ctx, config, client, prefectureStats, len(toots), yesterday); err != nil {
 		return fmt.Errorf("failed to post prefecture summary: %w", err)
 	}
 
@@ -352,11 +355,7 @@ func savePostedURLs(ctx context.Context, appConfig *Config, postedURLs []PostedU
 	return nil
 }
 
-func fetchRecentToots(ctx context.Context, client *mastodon.Client) ([]*mastodon.Status, error) {
-	jst := time.FixedZone("JST", JSTOffset)
-	now := time.Now().In(jst)
-	since := now.Add(-24 * time.Hour)
-
+func fetchRecentToots(ctx context.Context, client *mastodon.Client, since time.Time) ([]*mastodon.Status, error) {
 	account, err := client.GetAccountCurrentUser(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get current account: %w", err)
@@ -445,11 +444,17 @@ func aggregatePrefectures(toots []*mastodon.Status) []PrefectureCount {
 	return results
 }
 
-func postPrefectureSummary(ctx context.Context, config *Config, client *mastodon.Client, stats []PrefectureCount, totalPosts int) error {
-	postContent := fmt.Sprintf(SummaryPostTemplate, totalPosts, formatPrefectureStats(stats))
+func postPrefectureSummary(ctx context.Context, config *Config, client *mastodon.Client, stats []PrefectureCount, totalPosts int, date time.Time) error {
+	dateStr := date.Format("2006年1月2日")
+	postContent := fmt.Sprintf(SummaryPostTemplate, dateStr, totalPosts, formatPrefectureStats(stats))
 
-	if err := postToMastodonWithContent(ctx, config, client, postContent); err != nil {
+	status, err := postToMastodonWithContent(ctx, config, client, postContent)
+	if err != nil {
 		return fmt.Errorf("failed to post prefecture summary: %w", err)
+	}
+
+	if err := pinSummaryPosts(ctx, client, status.ID); err != nil {
+		log.Printf("Failed to pin summary post: %v", err)
 	}
 
 	return nil
@@ -526,7 +531,8 @@ func extractArticleInfo(s *goquery.Selection, page int) *PostedURL {
 func postSingleArticle(ctx context.Context, config *Config, client *mastodon.Client, article *PostedURL) bool {
 	post := fmt.Sprintf(KumaPostTemplate, article.Title, article.URL, article.Description)
 
-	if err := postToMastodonWithContent(ctx, config, client, post); err != nil {
+	_, err := postToMastodonWithContent(ctx, config, client, post)
+	if err != nil {
 		log.Printf("Failed to post article '%s': %v", article.Title, err)
 		return false
 	}
@@ -534,14 +540,69 @@ func postSingleArticle(ctx context.Context, config *Config, client *mastodon.Cli
 	return true
 }
 
-func postToMastodonWithContent(ctx context.Context, config *Config, client *mastodon.Client, content string) error {
-	_, err := client.PostStatus(ctx, &mastodon.Toot{
+func postToMastodonWithContent(ctx context.Context, config *Config, client *mastodon.Client, content string) (*mastodon.Status, error) {
+	status, err := client.PostStatus(ctx, &mastodon.Toot{
 		Status:     content,
 		Visibility: config.Mastodon.Visibility,
 	})
 	if err != nil {
 		log.Printf("Failed to post content to Mastodon:\n%s\nError: %v", content, err)
-		return fmt.Errorf("failed to post to Mastodon: %w", err)
+		return nil, fmt.Errorf("failed to post to Mastodon: %w", err)
+	}
+
+	return status, nil
+}
+
+func pinSummaryPosts(ctx context.Context, client *mastodon.Client, newStatusID mastodon.ID) error {
+	account, err := client.GetAccountCurrentUser(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to get current account: %w", err)
+	}
+
+	pinnedStatuses, err := client.GetAccountPinnedStatuses(ctx, account.ID)
+	if err != nil {
+		return fmt.Errorf("failed to get pinned statuses: %w", err)
+	}
+
+	if len(pinnedStatuses) >= 5 {
+		sort.Slice(pinnedStatuses, func(i, j int) bool {
+			return pinnedStatuses[i].CreatedAt.Before(pinnedStatuses[j].CreatedAt)
+		})
+
+		oldestPinned := pinnedStatuses[0]
+		req, err := http.NewRequestWithContext(ctx, "POST",
+			fmt.Sprintf("%s/api/v1/statuses/%s/unpin", client.Config.Server, oldestPinned.ID), nil)
+		if err != nil {
+			return fmt.Errorf("failed to create unpin request: %w", err)
+		}
+		req.Header.Set("Authorization", "Bearer "+client.Config.AccessToken)
+
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			return fmt.Errorf("failed to unpin oldest status: %w", err)
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			return fmt.Errorf("failed to unpin status, got status code: %d", resp.StatusCode)
+		}
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "POST",
+		fmt.Sprintf("%s/api/v1/statuses/%s/pin", client.Config.Server, newStatusID), nil)
+	if err != nil {
+		return fmt.Errorf("failed to create pin request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+client.Config.AccessToken)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to pin new summary status: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("failed to pin status, got status code: %d", resp.StatusCode)
 	}
 
 	return nil
