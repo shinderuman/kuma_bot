@@ -10,7 +10,8 @@
         "region": "ap-northeast-1",
         "s3": {
             "bucket_name": "kuma-posted-urls",
-            "object_key": "posted_urls.json"
+            "object_key": "posted_urls.json",
+            "rss_config_key": "rss_config.json"
         }
     }
 }

@@ -100,7 +100,8 @@ Lambda環境では以下の環境変数を設定してください：
 - `MASTODON_ACCESS_TOKEN` - Mastodonのアクセストークン
 - `MASTODON_VISIBILITY` - 投稿の可視性（オプション、デフォルト: unlisted）
 - `S3_BUCKET_NAME` - S3バケット名
-- `S3_OBJECT_KEY` - S3オブジェクトキー
+- `S3_OBJECT_KEY` - S3オブジェクトキー（投稿済みURL用）
+- `S3_RSS_CONFIG_KEY` - RSS設定ファイルのS3オブジェクトキー
 - `KUMA_AWS_REGION` - AWSリージョン（オプション、`AWS_REGION`が優先される）
 
 **注意**: `KUMA_AWS_REGION`を設定することで、Lambda環境でもカスタムリージョンを指定できます。設定しない場合は`AWS_REGION`（Lambda予約済み環境変数）が使用されます。
@@ -132,6 +133,7 @@ Lambda環境では以下の環境変数を設定してください：
 - `region` - AWSリージョン（例: ap-northeast-1）
 - `s3.bucket_name` - 投稿済みURL管理用S3バケット名
 - `s3.object_key` - S3オブジェクトキー（JSONファイル名）
+- `s3.rss_config_key` - RSS設定ファイルのS3オブジェクトキー
 
 ### 投稿形式
 
@@ -181,14 +183,15 @@ Lambda環境では以下の環境変数を設定してください：
 
 ```
 .
-├── main.go              # メインアプリケーション
-├── config.json          # 設定ファイル（Git管理対象外）
-├── config.json.example  # 設定ファイルのサンプル
-├── deploy.sh            # Lambdaデプロイスクリプト
-├── go.mod               # Go モジュール定義
-├── go.sum               # Go モジュール依存関係
-├── .gitignore           # Git除外設定
-└── README.md            # このファイル
+├── main.go                    # メインアプリケーション
+├── config.json              # 設定ファイル（Git管理対象外）
+├── config.json.example      # 設定ファイルのサンプル
+├── rss_config.json.example  # RSS設定ファイルのサンプル
+├── deploy.sh                # Lambdaデプロイスクリプト
+├── go.mod                   # Go モジュール定義
+├── go.sum                   # Go モジュール依存関係
+├── .gitignore               # Git除外設定
+└── README.md                # このファイル
 ```
 
 ## 依存ライブラリ
@@ -220,11 +223,13 @@ Lambda環境では以下の環境変数を設定してください：
 - RSS投稿: 500文字制限対応（文字数超過時は概要を省略）
 - コンテンツフィルタリング: クマ関連キーワード判定と除外キーワード設定
 
-### RSSフィード
+### RSSフィードと設定管理
 - 25+の主要な日本のニュースソースを監視
 - NHK、Yahooニュース、朝日新聞、毎日新聞、日本経済新聞など
 - クマ関連ニュースの自動検出と投稿
 - 重複URLの自動排除（RSSフィード間の重複も対応）
+- **S3ベースのRSS設定管理** - RSSソース、キーワードをS3上のJSONファイルで管理
+- **設定ファイル**: `rss_config.json`（S3）でRSSソースとフィルタリング設定を管理
 
 ## 注意事項
 

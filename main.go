@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"log"
 	"net/http"
 	"os"
@@ -58,20 +57,6 @@ const (
 )
 
 var (
-	includeKeywords = []string{
-		"クマ",
-		"熊",
-		"ツキノワグマ",
-		"ヒグマ",
-	}
-
-	excludeKeywords = []string{
-		"熊本",
-		"熊野",
-		"アイザックマン",
-		"オークマ",
-	}
-
 	prefectures = []string{
 		"北海道", "青森県", "岩手県", "宮城県", "秋田県", "山形県", "福島県",
 		"茨城県", "栃木県", "群馬県", "埼玉県", "千葉県", "東京都", "神奈川県",
@@ -80,34 +65,6 @@ var (
 		"奈良県", "和歌山県", "鳥取県", "島根県", "岡山県", "広島県", "山口県",
 		"徳島県", "香川県", "愛媛県", "高知県", "福岡県", "佐賀県", "長崎県",
 		"熊本県", "大分県", "宮崎県", "鹿児島県", "沖縄県",
-	}
-
-	rssSources = []string{
-		"https://news.web.nhk/n-data/conf/na/rss/cat0.xml",
-		"https://news.web.nhk/n-data/conf/na/rss/cat1.xml",
-		"https://news.web.nhk/n-data/conf/na/rss/cat2.xml",
-		"https://news.web.nhk/n-data/conf/na/rss/cat3.xml",
-		"https://news.web.nhk/n-data/conf/na/rss/cat4.xml",
-		"https://news.web.nhk/n-data/conf/na/rss/cat5.xml",
-		"https://news.web.nhk/n-data/conf/na/rss/cat6.xml",
-		"https://news.yahoo.co.jp/rss/categories/domestic.xml",
-		"https://news.yahoo.co.jp/rss/categories/world.xml",
-		"https://news.yahoo.co.jp/rss/categories/local.xml",
-		"https://www.asahi.com/rss/asahi/newsheadlines.rdf",
-		"https://www.asahi.com/rss/asahi/national.rdf",
-		"https://mainichi.jp/rss/etc/mainichi-flash.rss",
-		"https://assets.wor.jp/rss/rdf/nikkei/society.rdf",
-		"https://assets.wor.jp/rss/rdf/nikkei/local.rdf",
-		"https://assets.wor.jp/rss/rdf/reuters/world.rdf",
-		"https://assets.wor.jp/rss/rdf/bloomberg/domestic.rdf",
-		"https://assets.wor.jp/rss/rdf/sankei/affairs.rdf",
-		"https://assets.wor.jp/rss/rdf/sankei/life.rdf",
-		"https://assets.wor.jp/rss/rdf/yomiuri/national.rdf",
-		"https://assets.wor.jp/rss/rdf/ynnews/national.rdf",
-		"https://assets.wor.jp/rss/rdf/sankei/politics.rdf",
-		"https://assets.wor.jp/rss/rdf/yomiuri/politics.rdf",
-		"https://assets.wor.jp/rss/rdf/ynnews/politics.rdf",
-		"https://assets.wor.jp/rss/rdf/ynlocalnews/national.rdf",
 	}
 )
 
@@ -120,8 +77,9 @@ type MastodonConfig struct {
 }
 
 type S3Config struct {
-	BucketName string `json:"bucket_name"`
-	ObjectKey  string `json:"object_key"`
+	BucketName   string `json:"bucket_name"`
+	ObjectKey    string `json:"object_key"`
+	RSSConfigKey string `json:"rss_config_key"`
 }
 
 type AWSConfig struct {
@@ -147,6 +105,12 @@ type PrefectureCount struct {
 	Count      int    `json:"count"`
 }
 
+type RSSConfig struct {
+	IncludeKeywords []string `json:"include_keywords"`
+	ExcludeKeywords []string `json:"exclude_keywords"`
+	RSSSources      []string `json:"rss_sources"`
+}
+
 func main() {
 	if isLambda() {
 		lambda.Start(handleKumaBotRequest)
@@ -165,6 +129,11 @@ func handleKumaBotRequest(ctx context.Context) error {
 	config, err := loadConfig()
 	if err != nil {
 		return fmt.Errorf("failed to load config: %w", err)
+	}
+
+	rssConfig, err := loadRSSConfig(ctx, config)
+	if err != nil {
+		return fmt.Errorf("failed to load RSS config: %w", err)
 	}
 
 	client := newMastodonClient(config)
@@ -195,7 +164,7 @@ func handleKumaBotRequest(ctx context.Context) error {
 		return fmt.Errorf("failed to process kuma news: %w", err)
 	}
 
-	rssArticles, err := processRSSNews(existingURLMap)
+	rssArticles, err := processRSSNews(existingURLMap, rssConfig)
 	if err != nil {
 		return fmt.Errorf("failed to process RSS news: %w", err)
 	}
@@ -224,8 +193,9 @@ func loadConfig() (*Config, error) {
 			AWS: AWSConfig{
 				Region: getAWSRegion(),
 				S3: S3Config{
-					BucketName: os.Getenv("S3_BUCKET_NAME"),
-					ObjectKey:  os.Getenv("S3_OBJECT_KEY"),
+					BucketName:   os.Getenv("S3_BUCKET_NAME"),
+					ObjectKey:    os.Getenv("S3_OBJECT_KEY"),
+					RSSConfigKey: os.Getenv("S3_RSS_CONFIG_KEY"),
 				},
 			},
 		}, nil
@@ -254,6 +224,52 @@ func getAWSRegion() string {
 		return region
 	}
 	return "ap-northeast-1"
+}
+
+func loadRSSConfig(ctx context.Context, appConfig *Config) (*RSSConfig, error) {
+	if appConfig.AWS.S3.RSSConfigKey == "" {
+		return nil, fmt.Errorf("RSS config key not specified in config")
+	}
+
+	var rssConfig RSSConfig
+	if err := loadJSONFromS3(ctx, appConfig, appConfig.AWS.S3.RSSConfigKey, &rssConfig); err != nil {
+		return nil, fmt.Errorf("failed to load RSS config: %w", err)
+	}
+
+	return &rssConfig, nil
+}
+
+func loadPostedURLs(ctx context.Context, appConfig *Config) ([]PostedURL, error) {
+	var postedURLs []PostedURL
+	if err := loadJSONFromS3(ctx, appConfig, appConfig.AWS.S3.ObjectKey, &postedURLs); err != nil {
+		return nil, fmt.Errorf("failed to load posted URLs: %w", err)
+	}
+
+	return postedURLs, nil
+}
+
+func loadJSONFromS3[T any](ctx context.Context, appConfig *Config, key string, target *T) error {
+	cfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(appConfig.AWS.Region))
+	if err != nil {
+		return fmt.Errorf("failed to load AWS config: %w", err)
+	}
+
+	svc := s3.NewFromConfig(cfg)
+
+	result, err := svc.GetObject(ctx, &s3.GetObjectInput{
+		Bucket: aws.String(appConfig.AWS.S3.BucketName),
+		Key:    aws.String(key),
+	})
+	if err != nil {
+		return fmt.Errorf("failed to get object from S3: %w", err)
+	}
+	defer result.Body.Close()
+
+	if err := json.NewDecoder(result.Body).Decode(target); err != nil {
+		return fmt.Errorf("failed to unmarshal JSON from S3: %w", err)
+	}
+
+	return nil
 }
 
 func newMastodonClient(config *Config) *mastodon.Client {
@@ -288,36 +304,6 @@ func runPrefectureSummary(ctx context.Context, config *Config, client *mastodon.
 	}
 
 	return nil
-}
-
-func loadPostedURLs(ctx context.Context, appConfig *Config) ([]PostedURL, error) {
-	cfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(appConfig.AWS.Region))
-	if err != nil {
-		return nil, fmt.Errorf("failed to load AWS config: %w", err)
-	}
-
-	svc := s3.NewFromConfig(cfg)
-
-	result, err := svc.GetObject(ctx, &s3.GetObjectInput{
-		Bucket: aws.String(appConfig.AWS.S3.BucketName),
-		Key:    aws.String(appConfig.AWS.S3.ObjectKey),
-	})
-	if err != nil {
-		return nil, fmt.Errorf("failed to get object from S3: %w", err)
-	}
-	defer result.Body.Close()
-
-	body, err := io.ReadAll(result.Body)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read S3 object body: %w", err)
-	}
-
-	var postedURLs []PostedURL
-	if err := json.Unmarshal(body, &postedURLs); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal posted URLs: %w", err)
-	}
-
-	return postedURLs, nil
 }
 
 func cleanupOldURLs(existingURLs []PostedURL) []PostedURL {
@@ -369,10 +355,10 @@ func processKumaNews(existingURLMap map[string]struct{}) ([]PostedURL, error) {
 	return newPostedURLs, nil
 }
 
-func processRSSNews(existingURLMap map[string]struct{}) ([]PostedURL, error) {
+func processRSSNews(existingURLMap map[string]struct{}, rssConfig *RSSConfig) ([]PostedURL, error) {
 	fp := gofeed.NewParser()
 	var allArticles []PostedURL
-	for _, rssURL := range rssSources {
+	for _, rssURL := range rssConfig.RSSSources {
 		feed, err := fp.ParseURL(rssURL)
 		if err != nil {
 			log.Printf("Failed to fetch RSS from %s: %v", rssURL, err)
@@ -392,7 +378,7 @@ func processRSSNews(existingURLMap map[string]struct{}) ([]PostedURL, error) {
 			if item.Description != "" {
 				description = "🔗 " + item.Description
 			}
-			if !isBearRelatedNews(item.Title, description) {
+			if !isBearRelatedNews(item.Title, description, rssConfig) {
 				continue
 			}
 
@@ -422,16 +408,16 @@ func processRSSNews(existingURLMap map[string]struct{}) ([]PostedURL, error) {
 	return allArticles, nil
 }
 
-func isBearRelatedNews(title, description string) bool {
+func isBearRelatedNews(title, description string, rssConfig *RSSConfig) bool {
 	text := title + " " + description
 
-	for _, keyword := range excludeKeywords {
+	for _, keyword := range rssConfig.ExcludeKeywords {
 		if strings.Contains(text, keyword) {
 			return false
 		}
 	}
 
-	for _, keyword := range includeKeywords {
+	for _, keyword := range rssConfig.IncludeKeywords {
 		if strings.Contains(text, keyword) {
 			return true
 		}

@@ -1,0 +1,43 @@
+{
+    "include_keywords": [
+        "クマ",
+        "熊",
+        "ツキノワグマ",
+        "ヒグマ"
+    ],
+    "exclude_keywords": [
+        "熊本",
+        "熊野",
+        "アイザックマン",
+        "オークマ",
+        "クマモチ",
+        "くまモン"
+    ],
+    "rss_sources": [
+        "https://news.web.nhk/n-data/conf/na/rss/cat0.xml",
+        "https://news.web.nhk/n-data/conf/na/rss/cat1.xml",
+        "https://news.web.nhk/n-data/conf/na/rss/cat2.xml",
+        "https://news.web.nhk/n-data/conf/na/rss/cat3.xml",
+        "https://news.web.nhk/n-data/conf/na/rss/cat4.xml",
+        "https://news.web.nhk/n-data/conf/na/rss/cat5.xml",
+        "https://news.web.nhk/n-data/conf/na/rss/cat6.xml",
+        "https://news.yahoo.co.jp/rss/categories/domestic.xml",
+        "https://news.yahoo.co.jp/rss/categories/world.xml",
+        "https://news.yahoo.co.jp/rss/categories/local.xml",
+        "https://www.asahi.com/rss/asahi/newsheadlines.rdf",
+        "https://www.asahi.com/rss/asahi/national.rdf",
+        "https://mainichi.jp/rss/etc/mainichi-flash.rss",
+        "https://assets.wor.jp/rss/rdf/nikkei/society.rdf",
+        "https://assets.wor.jp/rss/rdf/nikkei/local.rdf",
+        "https://assets.wor.jp/rss/rdf/reuters/world.rdf",
+        "https://assets.wor.jp/rss/rdf/bloomberg/domestic.rdf",
+        "https://assets.wor.jp/rss/rdf/sankei/affairs.rdf",
+        "https://assets.wor.jp/rss/rdf/sankei/life.rdf",
+        "https://assets.wor.jp/rss/rdf/yomiuri/national.rdf",
+        "https://assets.wor.jp/rss/rdf/ynnews/national.rdf",
+        "https://assets.wor.jp/rss/rdf/sankei/politics.rdf",
+        "https://assets.wor.jp/rss/rdf/yomiuri/politics.rdf",
+        "https://assets.wor.jp/rss/rdf/ynnews/politics.rdf",
+        "https://assets.wor.jp/rss/rdf/ynlocalnews/national.rdf"
+    ]
+}
