@@ -21,6 +21,7 @@ import (
 
 	"github.com/PuerkitoBio/goquery"
 	"github.com/mattn/go-mastodon"
+	"github.com/mmcdole/gofeed"
 )
 
 const (
@@ -47,18 +48,68 @@ const (
 
 #クマ出没情報`
 
+	RSSNewsTemplate = `📰 クマ関連ニュース：%s
+
+%s%s
+
+#クマ関連ニュース`
+
 	prefecturePattern = `📍\s*([^\n📍]+)`
 )
 
-var prefectures = []string{
-	"北海道", "青森県", "岩手県", "宮城県", "秋田県", "山形県", "福島県",
-	"茨城県", "栃木県", "群馬県", "埼玉県", "千葉県", "東京都", "神奈川県",
-	"新潟県", "富山県", "石川県", "福井県", "山梨県", "長野県", "岐阜県",
-	"静岡県", "愛知県", "三重県", "滋賀県", "京都府", "大阪府", "兵庫県",
-	"奈良県", "和歌山県", "鳥取県", "島根県", "岡山県", "広島県", "山口県",
-	"徳島県", "香川県", "愛媛県", "高知県", "福岡県", "佐賀県", "長崎県",
-	"熊本県", "大分県", "宮崎県", "鹿児島県", "沖縄県",
-}
+var (
+	includeKeywords = []string{
+		"クマ",
+		"熊",
+		"ツキノワグマ",
+		"ヒグマ",
+	}
+
+	excludeKeywords = []string{
+		"熊本",
+		"熊野",
+		"アイザックマン",
+		"オークマ",
+	}
+
+	prefectures = []string{
+		"北海道", "青森県", "岩手県", "宮城県", "秋田県", "山形県", "福島県",
+		"茨城県", "栃木県", "群馬県", "埼玉県", "千葉県", "東京都", "神奈川県",
+		"新潟県", "富山県", "石川県", "福井県", "山梨県", "長野県", "岐阜県",
+		"静岡県", "愛知県", "三重県", "滋賀県", "京都府", "大阪府", "兵庫県",
+		"奈良県", "和歌山県", "鳥取県", "島根県", "岡山県", "広島県", "山口県",
+		"徳島県", "香川県", "愛媛県", "高知県", "福岡県", "佐賀県", "長崎県",
+		"熊本県", "大分県", "宮崎県", "鹿児島県", "沖縄県",
+	}
+
+	rssSources = []string{
+		"https://news.web.nhk/n-data/conf/na/rss/cat0.xml",
+		"https://news.web.nhk/n-data/conf/na/rss/cat1.xml",
+		"https://news.web.nhk/n-data/conf/na/rss/cat2.xml",
+		"https://news.web.nhk/n-data/conf/na/rss/cat3.xml",
+		"https://news.web.nhk/n-data/conf/na/rss/cat4.xml",
+		"https://news.web.nhk/n-data/conf/na/rss/cat5.xml",
+		"https://news.web.nhk/n-data/conf/na/rss/cat6.xml",
+		"https://news.yahoo.co.jp/rss/categories/domestic.xml",
+		"https://news.yahoo.co.jp/rss/categories/world.xml",
+		"https://news.yahoo.co.jp/rss/categories/local.xml",
+		"https://www.asahi.com/rss/asahi/newsheadlines.rdf",
+		"https://www.asahi.com/rss/asahi/national.rdf",
+		"https://mainichi.jp/rss/etc/mainichi-flash.rss",
+		"https://assets.wor.jp/rss/rdf/nikkei/society.rdf",
+		"https://assets.wor.jp/rss/rdf/nikkei/local.rdf",
+		"https://assets.wor.jp/rss/rdf/reuters/world.rdf",
+		"https://assets.wor.jp/rss/rdf/bloomberg/domestic.rdf",
+		"https://assets.wor.jp/rss/rdf/sankei/affairs.rdf",
+		"https://assets.wor.jp/rss/rdf/sankei/life.rdf",
+		"https://assets.wor.jp/rss/rdf/yomiuri/national.rdf",
+		"https://assets.wor.jp/rss/rdf/ynnews/national.rdf",
+		"https://assets.wor.jp/rss/rdf/sankei/politics.rdf",
+		"https://assets.wor.jp/rss/rdf/yomiuri/politics.rdf",
+		"https://assets.wor.jp/rss/rdf/ynnews/politics.rdf",
+		"https://assets.wor.jp/rss/rdf/ynlocalnews/national.rdf",
+	}
+)
 
 type MastodonConfig struct {
 	Server       string `json:"server"`
@@ -134,13 +185,23 @@ func handleKumaBotRequest(ctx context.Context) error {
 
 	existingURLs = cleanupOldURLs(existingURLs)
 
-	newPostedURLs, err := processLatestNews(existingURLs)
-	if err != nil {
-		return fmt.Errorf("failed to process latest news: %w", err)
+	existingURLMap := make(map[string]struct{})
+	for _, posted := range existingURLs {
+		existingURLMap[posted.URL] = struct{}{}
 	}
 
-	if len(newPostedURLs) > 0 {
-		successfullyPostedURLs := postToMastodon(ctx, config, client, newPostedURLs)
+	kumaArticles, err := processKumaNews(existingURLMap)
+	if err != nil {
+		return fmt.Errorf("failed to process kuma news: %w", err)
+	}
+
+	rssArticles, err := processRSSNews(existingURLMap)
+	if err != nil {
+		return fmt.Errorf("failed to process RSS news: %w", err)
+	}
+
+	if len(kumaArticles) > 0 || len(rssArticles) > 0 {
+		successfullyPostedURLs := postToMastodon(ctx, config, client, kumaArticles, rssArticles)
 
 		if err := savePostedURLs(ctx, config, append(existingURLs, successfullyPostedURLs...)); err != nil {
 			return fmt.Errorf("failed to save posted URLs: %w", err)
@@ -272,12 +333,7 @@ func cleanupOldURLs(existingURLs []PostedURL) []PostedURL {
 	return validURLs
 }
 
-func processLatestNews(existingURLs []PostedURL) ([]PostedURL, error) {
-	existingURLMap := make(map[string]struct{})
-	for _, posted := range existingURLs {
-		existingURLMap[posted.URL] = struct{}{}
-	}
-
+func processKumaNews(existingURLMap map[string]struct{}) ([]PostedURL, error) {
 	var allArticles []*PostedURL
 
 	for page := 1; page <= MaxPages; page++ {
@@ -313,20 +369,92 @@ func processLatestNews(existingURLs []PostedURL) ([]PostedURL, error) {
 	return newPostedURLs, nil
 }
 
-func postToMastodon(ctx context.Context, config *Config, client *mastodon.Client, articles []PostedURL) []PostedURL {
+func processRSSNews(existingURLMap map[string]struct{}) ([]PostedURL, error) {
+	fp := gofeed.NewParser()
+	var allArticles []PostedURL
+	for _, rssURL := range rssSources {
+		feed, err := fp.ParseURL(rssURL)
+		if err != nil {
+			log.Printf("Failed to fetch RSS from %s: %v", rssURL, err)
+			continue
+		}
+
+		for _, item := range feed.Items {
+			if item.Link == "" {
+				continue
+			}
+
+			if _, exists := existingURLMap[item.Link]; exists {
+				continue
+			}
+
+			var description string
+			if item.Description != "" {
+				description = "🔗 " + item.Description
+			}
+			if !isBearRelatedNews(item.Title, description) {
+				continue
+			}
+
+			// HTMLタグを除去
+			doc, err := goquery.NewDocumentFromReader(strings.NewReader(description))
+			if err == nil {
+				description = doc.Text()
+			}
+			description = "\n\n" + strings.TrimSpace(description)
+
+			article := PostedURL{
+				URL:         item.Link,
+				Title:       item.Title,
+				Description: description,
+				PublishedAt: *item.PublishedParsed,
+			}
+
+			allArticles = append(allArticles, article)
+			existingURLMap[item.Link] = struct{}{}
+		}
+	}
+
+	sort.Slice(allArticles, func(i, j int) bool {
+		return allArticles[i].PublishedAt.Before(allArticles[j].PublishedAt)
+	})
+
+	return allArticles, nil
+}
+
+func isBearRelatedNews(title, description string) bool {
+	text := title + " " + description
+
+	for _, keyword := range excludeKeywords {
+		if strings.Contains(text, keyword) {
+			return false
+		}
+	}
+
+	for _, keyword := range includeKeywords {
+		if strings.Contains(text, keyword) {
+			return true
+		}
+	}
+
+	return false
+}
+
+func postToMastodon(ctx context.Context, config *Config, client *mastodon.Client, kumaArticles []PostedURL, rssArticles []PostedURL) []PostedURL {
+	return append(postArticlesByType(ctx, config, client, kumaArticles, false), postArticlesByType(ctx, config, client, rssArticles, true)...)
+}
+
+func postArticlesByType(ctx context.Context, config *Config, client *mastodon.Client, articles []PostedURL, isRss bool) []PostedURL {
 	var successfullyPosted []PostedURL
-	for i, article := range articles {
-		success := postSingleArticle(ctx, config, client, &article)
+	for _, article := range articles {
+		success := postSingleArticle(ctx, config, client, &article, isRss)
 		if success {
 			article.PostedAt = time.Now()
 			successfullyPosted = append(successfullyPosted, article)
 		}
 
-		if i < len(articles)-1 {
-			time.Sleep(PostDelay)
-		}
+		time.Sleep(PostDelay)
 	}
-
 	return successfullyPosted
 }
 
@@ -535,8 +663,16 @@ func extractArticleInfo(s *goquery.Selection, page int) *PostedURL {
 	}
 }
 
-func postSingleArticle(ctx context.Context, config *Config, client *mastodon.Client, article *PostedURL) bool {
-	post := fmt.Sprintf(KumaPostTemplate, article.Title, article.URL, article.Description)
+func postSingleArticle(ctx context.Context, config *Config, client *mastodon.Client, article *PostedURL, isRss bool) bool {
+	var post string
+	if isRss {
+		post = fmt.Sprintf(RSSNewsTemplate, article.Title, article.URL, article.Description)
+		if len([]rune(post)) > 500 {
+			post = fmt.Sprintf(RSSNewsTemplate, article.Title, article.URL, "")
+		}
+	} else {
+		post = fmt.Sprintf(KumaPostTemplate, article.Title, article.URL, article.Description)
+	}
 
 	_, err := postToMastodonWithContent(ctx, config, client, post)
 	if err != nil {
