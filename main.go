@@ -31,6 +31,7 @@ const (
 	JSTOffset              = 9 * 60 * 60
 	PostDelay              = 200 * time.Millisecond
 	HTTPTimeout            = 30 * time.Second
+	OtherPrefecture        = "その他"
 	KumaPostTemplate       = `🐻 %s
 
 🔗 %s
@@ -330,6 +331,11 @@ func postToMastodon(ctx context.Context, config *Config, client *mastodon.Client
 }
 
 func savePostedURLs(ctx context.Context, appConfig *Config, postedURLs []PostedURL) error {
+	if os.Getenv("DRY_RUN") == "1" {
+		log.Printf("DRY RUN: Would save %d URLs to S3", len(postedURLs))
+		return nil
+	}
+
 	cfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(appConfig.AWS.Region))
 	if err != nil {
 		return fmt.Errorf("failed to load AWS config: %w", err)
@@ -437,7 +443,7 @@ func aggregatePrefectures(toots []*mastodon.Status) []PrefectureCount {
 
 	if otherCount > 0 {
 		results = append(results, PrefectureCount{
-			Prefecture: "その他",
+			Prefecture: OtherPrefecture,
 			Count:      otherCount,
 		})
 	}
@@ -542,6 +548,11 @@ func postSingleArticle(ctx context.Context, config *Config, client *mastodon.Cli
 }
 
 func postToMastodonWithContent(ctx context.Context, config *Config, client *mastodon.Client, content string) (*mastodon.Status, error) {
+	if os.Getenv("DRY_RUN") == "1" {
+		log.Printf("DRY RUN: Would post to Mastodon:\n%s", content)
+		return &mastodon.Status{ID: mastodon.ID("dry-run")}, nil
+	}
+
 	status, err := client.PostStatus(ctx, &mastodon.Toot{
 		Status:     content,
 		Visibility: config.Mastodon.Visibility,
@@ -621,8 +632,19 @@ func extractPrefecture(text string) string {
 
 func formatPrefectureStats(stats []PrefectureCount) string {
 	var lines []string
-	for i, stat := range stats {
-		lines = append(lines, fmt.Sprintf("%d. %s：%d件", i+1, stat.Prefecture, stat.Count))
+	currentRank := 1
+	prevCount := -1
+
+	for _, stat := range stats {
+		if stat.Prefecture == OtherPrefecture {
+			lines = append(lines, fmt.Sprintf("    %s：%d件", stat.Prefecture, stat.Count))
+		} else {
+			if prevCount != -1 && stat.Count < prevCount {
+				currentRank = len(lines) + 1
+			}
+			lines = append(lines, fmt.Sprintf("%2d. %s：%d件", currentRank, stat.Prefecture, stat.Count))
+			prevCount = stat.Count
+		}
 	}
 	return strings.Join(lines, "\n")
 }
