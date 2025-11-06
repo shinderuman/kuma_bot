@@ -102,7 +102,7 @@ Lambda環境では以下の環境変数を設定してください：
 - `S3_BUCKET_NAME` - S3バケット名
 - `S3_OBJECT_KEY` - S3オブジェクトキー（投稿済みURL用）
 - `S3_RSS_CONFIG_KEY` - RSS設定ファイルのS3オブジェクトキー
-- `KUMA_AWS_REGION` - AWSリージョン（オプション、`AWS_REGION`が優先される）
+- `KUMA_AWS_REGION` - AWSリージョン（オプション、`AWS_REGION`より優先される）
 
 **注意**: `KUMA_AWS_REGION`を設定することで、Lambda環境でもカスタムリージョンを指定できます。設定しない場合は`AWS_REGION`（Lambda予約済み環境変数）が使用されます。
 
