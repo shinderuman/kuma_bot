@@ -310,9 +310,7 @@ func runPrefectureSummary(ctx context.Context, config *Config, client *mastodon.
 		return fmt.Errorf("failed to fetch recent toots: %w", err)
 	}
 
-	prefectureStats := aggregatePrefectures(toots)
-
-	if err := postPrefectureSummary(ctx, config, client, prefectureStats, len(toots), yesterday); err != nil {
+	if err := postPrefectureSummary(ctx, config, client, toots, yesterday); err != nil {
 		return fmt.Errorf("failed to post prefecture summary: %w", err)
 	}
 
@@ -532,10 +530,10 @@ func fetchRecentToots(ctx context.Context, client *mastodon.Client, since time.T
 	return allToots, nil
 }
 
-func aggregatePrefectures(toots []*mastodon.Status) []PrefectureCount {
+func aggregatePrefectures(toots []*mastodon.Status) ([]PrefectureCount, int) {
 	prefectureCountMap := make(map[string]int)
 	prefectureRegex := regexp.MustCompile(prefecturePattern)
-
+	var totalCount int
 	var otherCount int
 	for _, toot := range toots {
 		matches := prefectureRegex.FindStringSubmatch(toot.Content)
@@ -548,6 +546,7 @@ func aggregatePrefectures(toots []*mastodon.Status) []PrefectureCount {
 			} else {
 				otherCount++
 			}
+			totalCount++
 		}
 	}
 
@@ -573,12 +572,13 @@ func aggregatePrefectures(toots []*mastodon.Status) []PrefectureCount {
 		})
 	}
 
-	return results
+	return results, totalCount
 }
 
-func postPrefectureSummary(ctx context.Context, config *Config, client *mastodon.Client, stats []PrefectureCount, totalPosts int, date time.Time) error {
+func postPrefectureSummary(ctx context.Context, config *Config, client *mastodon.Client, toots []*mastodon.Status, date time.Time) error {
+	prefectureStats, totalPosts := aggregatePrefectures(toots)
 	dateStr := date.Format("2006年1月2日")
-	postContent := fmt.Sprintf(SummaryPostTemplate, dateStr, totalPosts, formatPrefectureStats(stats))
+	postContent := fmt.Sprintf(SummaryPostTemplate, dateStr, totalPosts, formatPrefectureStats(prefectureStats))
 
 	status, err := postToMastodonWithContent(ctx, config, client, postContent)
 	if err != nil {
