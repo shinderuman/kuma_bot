@@ -686,6 +686,7 @@ func postToMastodonWithContent(ctx context.Context, config *Config, client *mast
 		return &mastodon.Status{ID: mastodon.ID("dry-run")}, nil
 	}
 
+	log.Printf("Post to Mastodon:\n%s", content)
 	status, err := client.PostStatus(ctx, &mastodon.Toot{
 		Status:     content,
 		Visibility: config.Mastodon.Visibility,
