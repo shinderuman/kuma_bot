@@ -40,6 +40,7 @@ const (
 📍 %s
 
 #クマ出没情報`
+
 	SummaryPostTemplate = `🐻 %sのクマ出没情報集計（全%d件）
 ※あくまで出没情報記事数の集計なので実際の出没数とは限りません
 
@@ -387,18 +388,16 @@ func processRSSNews(existingURLMap map[string]struct{}, rssConfig *RSSConfig) ([
 
 			var description string
 			if item.Description != "" {
-				description = "🔗 " + item.Description
+				description = item.Description
+				doc, err := goquery.NewDocumentFromReader(strings.NewReader(description))
+				if err == nil {
+					description = doc.Text()
+				}
+				description = "\n\n🔗 " + strings.TrimSpace(description) + "…"
 			}
 			if !isBearRelatedNews(item.Title, description, rssConfig) {
 				continue
 			}
-
-			// HTMLタグを除去
-			doc, err := goquery.NewDocumentFromReader(strings.NewReader(description))
-			if err == nil {
-				description = doc.Text()
-			}
-			description = "\n\n" + strings.TrimSpace(description)
 
 			article := PostedURL{
 				URL:         item.Link,
