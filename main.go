@@ -302,7 +302,8 @@ func isMidnightJST() bool {
 
 func runPrefectureSummary(ctx context.Context, config *Config, client *mastodon.Client) error {
 	jst := time.FixedZone("JST", JSTOffset)
-	yesterday := time.Now().In(jst).AddDate(0, 0, -1)
+	prev := time.Now().In(jst).AddDate(0, 0, -1)
+	yesterday := time.Date(prev.Year(), prev.Month(), prev.Day(), 0, 0, 0, 0, jst)
 
 	toots, err := fetchRecentToots(ctx, client, yesterday)
 	if err != nil {
