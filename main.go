@@ -33,6 +33,7 @@ const (
 	PostDelay              = 200 * time.Millisecond
 	HTTPTimeout            = 30 * time.Second
 	OtherPrefecture        = "その他"
+	SummaryTime            = "0:00"
 	KumaPostTemplate       = `🐻 %s
 
 🔗 %s
@@ -147,7 +148,9 @@ func handleKumaBotRequest(ctx context.Context) error {
 
 	client := newMastodonClient(config)
 
-	if isMidnightJST() || os.Getenv("KUMA_FORCE_SUMMARY") != "" {
+	if isSummary, err := isSummaryTime(); err != nil {
+		return fmt.Errorf("failed to check summary time: %w", err)
+	} else if isSummary || os.Getenv("KUMA_FORCE_SUMMARY") != "" {
 		log.Println("Starting prefecture summary mode")
 		if err := runPrefectureSummary(ctx, config, client); err != nil {
 			return fmt.Errorf("failed to run prefecture summary: %w", err)
@@ -293,11 +296,15 @@ func newMastodonClient(config *Config) *mastodon.Client {
 	})
 }
 
-func isMidnightJST() bool {
+func isSummaryTime() (bool, error) {
 	jst := time.FixedZone("JST", JSTOffset)
 	now := time.Now().In(jst)
 
-	return now.Hour() == 0 && now.Minute() == 0
+	targetTime, err := time.ParseInLocation("15:04", SummaryTime, jst)
+	if err != nil {
+		return false, fmt.Errorf("invalid SummaryTime constant '%s': %w", SummaryTime, err)
+	}
+	return now.Hour() == targetTime.Hour() && now.Minute() == targetTime.Minute(), nil
 }
 
 func runPrefectureSummary(ctx context.Context, config *Config, client *mastodon.Client) error {
